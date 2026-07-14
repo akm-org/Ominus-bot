@@ -1,0 +1,30 @@
+# ===========================================================================
+# Minecraft Automation Bot — Python dependencies
+# ===========================================================================
+# Install with:
+#   pip install -r requirements.txt
+#
+# Node.js 18+ must also be installed for the Mineflayer bridge to work.
+# After installing Python deps, run:
+#   cd minecraft_bot && npm install
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Core bridge – allows Python to call Node.js / npm packages directly
+# ---------------------------------------------------------------------------
+javascript>=1.1.0
+
+# ---------------------------------------------------------------------------
+# Async helpers
+# ---------------------------------------------------------------------------
+# (asyncio is stdlib – no extra install needed)
+
+# ---------------------------------------------------------------------------
+# Optional: coloured terminal output enhancement (logger.py uses stdlib ANSI)
+# ---------------------------------------------------------------------------
+# colorama>=0.4.6   # Uncomment on Windows if ANSI codes don't render
+
+# ---------------------------------------------------------------------------
+# Optional: load config from a .env file instead of environment variables
+# ---------------------------------------------------------------------------
+python-dotenv>=1.0.0

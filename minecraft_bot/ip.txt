@@ -1,0 +1,4 @@
+# Put your Minecraft server IP address below (one line, no spaces)
+# Example:  play.myserver.net
+# Example:  192.168.1.100
+
