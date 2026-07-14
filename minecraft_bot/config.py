@@ -76,6 +76,10 @@ WAIT_FOR_KEY_DROP: float = float(os.environ.get("WAIT_FOR_KEY_DROP", "10"))
 ROTATION_SPEED: float = float(os.environ.get("ROTATION_SPEED", "25"))  # degrees/s
 RECONNECT_DELAY: float = float(os.environ.get("RECONNECT_DELAY", "5"))
 
+# Seconds after TPA is accepted before the bot automatically disconnects.
+# Acts as a hard safety timeout so the cycle never gets stuck.
+AUTO_LEAVE_SECONDS: float = float(os.environ.get("AUTO_LEAVE_SECONDS", "100"))
+
 # Parallel instances
 MAX_BOTS: int = int(os.environ.get("MAX_BOTS", "1"))
 

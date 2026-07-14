@@ -4,11 +4,13 @@ minecraft_bot.py
 Core Minecraft bot implementation using the Mineflayer Node.js library
 bridged through the ``javascript`` Python package.
 
-Each ``MinecraftBot`` instance represents a single bot lifecycle:
-  Generate name → Join → Register → Login → Wait TP → Accept → Wait 5s
-  → Rotate → Spam click → Vault opens → Disconnect → Done
-
-The caller (``BotManager``) loops this as many times as needed.
+Lifecycle (per cycle):
+  Generate name → Join → Register → Login
+  → Wait for /tpa ONLY (strict match, login messages ignored)
+  → /tpaccept → Wait 5s → Wait 10s (key drop)
+  → Rotate + Spam click
+  → Vault opens  OR  100s auto-leave  OR  AKMVyron whispers "leave"
+  → Disconnect → Repeat with new username
 """
 
 from __future__ import annotations
@@ -33,7 +35,6 @@ log = get_logger("Bot")
 # Mineflayer (loaded once at module level; shared across bots)
 # ---------------------------------------------------------------------------
 mineflayer = require("mineflayer")
-pathfinder = None   # loaded lazily – only if needed in future
 
 
 # ---------------------------------------------------------------------------
@@ -41,17 +42,17 @@ pathfinder = None   # loaded lazily – only if needed in future
 # ---------------------------------------------------------------------------
 
 class BotState(Enum):
-    IDLE        = auto()
-    CONNECTING  = auto()
-    REGISTERING = auto()
-    LOGGING_IN  = auto()
-    WAITING_TP  = auto()
-    TELEPORTING = auto()
-    ROTATING    = auto()
-    VAULT       = auto()
+    IDLE          = auto()
+    CONNECTING    = auto()
+    REGISTERING   = auto()
+    LOGGING_IN    = auto()
+    WAITING_TP    = auto()   # ← TPA listener is only active here
+    TELEPORTING   = auto()
+    KEY_DROP      = auto()
+    VAULT         = auto()
     DISCONNECTING = auto()
-    DONE        = auto()
-    ERROR       = auto()
+    DONE          = auto()
+    ERROR         = auto()
 
 
 # ---------------------------------------------------------------------------
@@ -67,8 +68,8 @@ class MinecraftBot:
     username:
         The in-game name to use for this session.
     on_done:
-        Optional callback invoked when the lifecycle finishes (cleanly or
-        with an error).  Signature: ``on_done(username: str, error: bool)``.
+        Optional callback invoked when the lifecycle finishes.
+        Signature: ``on_done(username: str, error: bool)``.
     """
 
     def __init__(
@@ -82,20 +83,24 @@ class MinecraftBot:
         self._state: BotState = BotState.IDLE
         self._state_lock = asyncio.Lock()
 
-        # Events used to synchronise async steps
+        # ── Lifecycle sync events ──────────────────────────────────────────
         self._spawned       = asyncio.Event()
-        self._registered    = asyncio.Event()
-        self._logged_in     = asyncio.Event()
         self._tp_accepted   = asyncio.Event()
-        self._disconnected  = asyncio.Event()
 
-        # Sub-controllers (created after spawn)
+        # ── Leave signal ──────────────────────────────────────────────────
+        # Set by:  (a) AKMVyron whispering "leave"
+        #          (b) the 100-second auto-leave timer
+        self._leave_event   = asyncio.Event()
+        self._leave_reason: str = ""
+
+        # ── Sub-controllers (created after spawn) ─────────────────────────
         self._rotation: Optional[RotationController] = None
         self._inventory: Optional[InventoryManager] = None
         self._vault: Optional[VaultInteractor] = None
 
-        # Track start time for diagnostics
+        # ── Timing ────────────────────────────────────────────────────────
         self._start_time: float = 0.0
+        self._auto_leave_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -103,7 +108,7 @@ class MinecraftBot:
 
     @property
     def state(self) -> BotState:
-        """Current state of the bot lifecycle."""
+        """Current lifecycle state."""
         return self._state
 
     # ------------------------------------------------------------------
@@ -114,11 +119,7 @@ class MinecraftBot:
         """
         Execute the full bot lifecycle from connection to disconnect.
 
-        Returns
-        -------
-        bool
-            ``True`` on a successful vault cycle, ``False`` if an error
-            prevented completion.
+        Returns ``True`` on a successful vault cycle, ``False`` otherwise.
         """
         self._start_time = time.monotonic()
         success = False
@@ -129,7 +130,7 @@ class MinecraftBot:
             await self._wait_spawn()
             await self._register()
             await self._login()
-            await self._wait_for_tp()
+            await self._wait_for_tp()       # strict TPA-only; attaches listeners
             await self._accept_tp_delay()
             await self._wait_for_key_pickup()
             await self._do_vault()
@@ -144,9 +145,13 @@ class MinecraftBot:
             await self._set_state(BotState.ERROR)
 
         finally:
+            self._cancel_auto_leave()
             await self._disconnect_bot()
             elapsed = time.monotonic() - self._start_time
-            log.info(f"[{self.username}] Lifecycle finished in {elapsed:.1f}s (success={success})")
+            log.info(
+                f"[{self.username}] Lifecycle finished in {elapsed:.1f}s "
+                f"(success={success})"
+            )
             if self._on_done:
                 try:
                     self._on_done(self.username, not success)
@@ -162,18 +167,18 @@ class MinecraftBot:
     async def _connect(self) -> None:
         """Create the Mineflayer bot and attach core event listeners."""
         await self._set_state(BotState.CONNECTING)
-        log.info(f"[{self.username}] Connecting to {config.HOST}:{config.PORT} (v{config.VERSION})…")
-
-        options = {
-            "host":     config.HOST,
-            "port":     config.PORT,
-            "username": self.username,
-            "version":  config.VERSION,
-            "auth":     "offline",
+        log.info(
+            f"[{self.username}] Connecting to "
+            f"{config.HOST}:{config.PORT} (v{config.VERSION})…"
+        )
+        self._bot = mineflayer.createBot({
+            "host":       config.HOST,
+            "port":       config.PORT,
+            "username":   self.username,
+            "version":    config.VERSION,
+            "auth":       "offline",
             "hideErrors": False,
-        }
-
-        self._bot = mineflayer.createBot(options)
+        })
         self._attach_core_listeners()
         log.success(f"[{self.username}] Connected")
 
@@ -189,7 +194,6 @@ class MinecraftBot:
         except asyncio.TimeoutError:
             raise RuntimeError("Timed out waiting for spawn")
 
-        # Initialise sub-controllers now the bot object is live
         self._rotation  = RotationController(self._bot)
         self._inventory = InventoryManager(self._bot)
         self._vault     = VaultInteractor(self._bot, self._inventory, self._rotation)
@@ -199,12 +203,15 @@ class MinecraftBot:
     # ------------------------------------------------------------------
 
     async def _register(self) -> None:
-        """Send /register command immediately after spawning."""
+        """
+        Send /register immediately after spawning.
+
+        Waits 2 s then continues regardless — the server may already know
+        this username.  We do NOT accept any TPA during this window.
+        """
         await self._set_state(BotState.REGISTERING)
-        cmd = f"/register {config.PASSWORD} {config.PASSWORD}"
         log.info(f"[{self.username}] Sending /register…")
-        self._bot.chat(cmd)
-        # Wait 2 s then continue regardless (server may say "already registered")
+        self._bot.chat(f"/register {config.PASSWORD} {config.PASSWORD}")
         await sleep(2)
         log.success(f"[{self.username}] Registered (or already registered)")
 
@@ -213,28 +220,52 @@ class MinecraftBot:
     # ------------------------------------------------------------------
 
     async def _login(self) -> None:
-        """Send /login and wait for acknowledgement or simply proceed."""
+        """
+        Send /login and wait for the server to process it.
+
+        We do NOT accept any TPA during this window.
+        """
         await self._set_state(BotState.LOGGING_IN)
         log.info(f"[{self.username}] Sending /login…")
         self._bot.chat(f"/login {config.PASSWORD}")
-        # Give the server a moment to process the login
         await sleep(2)
         log.success(f"[{self.username}] Logged in")
 
     # ------------------------------------------------------------------
-    # Step: wait for TP request from TP_PLAYER
+    # Step: wait for /tpa from TP_PLAYER  (strict — login-safe)
     # ------------------------------------------------------------------
 
     async def _wait_for_tp(self) -> None:
         """
-        Listen for a teleport request or /tpa message from ``config.TP_PLAYER``
-        and automatically respond with /tpaccept.
+        Enter WAITING_TP state and block until a proper /tpa request arrives
+        from ``config.TP_PLAYER``.
+
+        STRICT rules — the bot will NOT accept a TP if:
+        - The bot is still in REGISTERING or LOGGING_IN state
+        - The message does not come from / about ``config.TP_PLAYER``
+        - The message is a generic chat line that happens to contain "tpa"
+
+        ONLY these message patterns trigger /tpaccept:
+        1. Server notification containing TP_PLAYER's name AND one of the
+           canonical TPA keywords (case-insensitive):
+               "has requested", "wants to teleport", "sent a teleport request"
+        2. A direct whisper/PM from TP_PLAYER whose body is exactly "/tpa"
+           or starts with "/tpa ".
+
+        Also attaches the leave listener (whisper "leave" from TP_PLAYER).
         """
         await self._set_state(BotState.WAITING_TP)
-        log.info(f"[{self.username}] Waiting for TP from {config.TP_PLAYER}…")
+        log.info(
+            f"[{self.username}] Waiting for /tpa from {config.TP_PLAYER} "
+            f"(timeout={config.TP_WAIT_TIMEOUT}s)…"
+        )
 
         self._tp_accepted.clear()
-        self._attach_chat_listener()
+        self._leave_event.clear()
+
+        # Attach both listeners now (leave listener stays active for whole session)
+        self._attach_tpa_listener()
+        self._attach_leave_listener()
 
         try:
             await asyncio.wait_for(
@@ -243,10 +274,18 @@ class MinecraftBot:
             )
         except asyncio.TimeoutError:
             raise RuntimeError(
-                f"No TP request from {config.TP_PLAYER} within "
+                f"No /tpa from {config.TP_PLAYER} within "
                 f"{config.TP_WAIT_TIMEOUT}s"
             )
+
         log.success(f"[{self.username}] TP accepted")
+
+        # ── Start 100-second auto-leave timer ─────────────────────────────
+        # The timer fires if the cycle takes too long (safety net).
+        self._auto_leave_task = asyncio.create_task(
+            self._auto_leave_timer(config.AUTO_LEAVE_SECONDS),
+            name="auto-leave-timer",
+        )
 
     # ------------------------------------------------------------------
     # Step: post-TP delay
@@ -254,75 +293,99 @@ class MinecraftBot:
 
     async def _accept_tp_delay(self) -> None:
         """
-        Wait ``config.WAIT_AFTER_TP`` seconds after the teleport before moving.
+        Wait ``config.WAIT_AFTER_TP`` seconds after teleport.
 
-        This gives the server time to move the bot to the vault room.
+        Respects the leave signal — disconnects immediately if it fires.
         """
         await self._set_state(BotState.TELEPORTING)
         delay = config.WAIT_AFTER_TP
-        log.info(f"[{self.username}] Teleported – waiting {delay}s before interacting…")
-        await sleep(delay)
+        log.info(f"[{self.username}] Teleported – waiting {delay}s…")
+        await self._interruptible_sleep(delay)
 
     # ------------------------------------------------------------------
-    # Step: wait for operator to drop the Ominous Vault key
+    # Step: wait for key drop
     # ------------------------------------------------------------------
 
     async def _wait_for_key_pickup(self) -> None:
         """
         Stand still for ``config.WAIT_FOR_KEY_DROP`` seconds so the operator
-        has time to drop the Ominous Vault key on the ground.
+        can drop the Ominous Vault key.
 
-        The bot remains stationary — it does not move or look around.
-        The Mineflayer engine picks up dropped items automatically when they
-        land within collection range, so no extra action is needed here.
-
-        After the timer expires, the flow continues directly to vault
-        interaction (rotation + right-click spam).
+        Mineflayer picks up nearby items automatically.
+        Respects the leave signal — disconnects immediately if it fires.
         """
+        await self._set_state(BotState.KEY_DROP)
         delay = config.WAIT_FOR_KEY_DROP
         log.info(
             f"[{self.username}] Waiting {delay}s for key drop — "
             f"drop the Ominous Vault key now!"
         )
-
-        # Count down in 1-second increments so the log stays informative
         for remaining in range(int(delay), 0, -1):
             log.debug(f"[{self.username}] Key pickup window: {remaining}s remaining…")
-            await sleep(1)
+            await self._interruptible_sleep(1)
 
-        # Handle any sub-second remainder
         leftover = delay - int(delay)
         if leftover > 0:
-            await sleep(leftover)
+            await self._interruptible_sleep(leftover)
 
         log.success(f"[{self.username}] Key pickup window finished – proceeding to vault")
 
     # ------------------------------------------------------------------
-    # Step: vault interaction (rotate + click)
+    # Step: vault interaction
     # ------------------------------------------------------------------
 
     async def _do_vault(self) -> None:
         """
-        Start rotating, spam right-click the vault, wait for it to open,
-        collect rewards, then clean up.
+        Rotate + spam right-click the vault.
+
+        Exits when the FIRST of these occurs:
+        - Vault window opens (success)
+        - ``_leave_event`` is set (whisper "leave" OR 100-second auto-timer)
         """
         await self._set_state(BotState.VAULT)
         log.info(f"[{self.username}] Starting vault interaction")
 
-        # Level the pitch (look straight)
         self._rotation.look_straight()
-        # Begin continuous rotation
         self._rotation.start()
 
         try:
-            # Spam-click until the vault opens
-            opened = await self._vault.open_vault(timeout=config.VAULT_OPEN_TIMEOUT)
+            # Race: vault opens  vs  leave signal
+            vault_task = asyncio.create_task(
+                self._vault.open_vault(timeout=config.VAULT_OPEN_TIMEOUT),
+                name="vault-open",
+            )
+            leave_task = asyncio.create_task(
+                self._leave_event.wait(),
+                name="leave-wait",
+            )
 
-            if opened:
-                log.success(f"[{self.username}] Vault opened – collecting rewards…")
-                await self._inventory.wait_for_rewards_and_close()
-            else:
-                log.error(f"[{self.username}] Vault failed to open")
+            done, pending = await asyncio.wait(
+                {vault_task, leave_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # Cancel whichever didn't finish
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            if leave_task in done:
+                # Leave was requested (whisper or auto-timer)
+                log.info(
+                    f"[{self.username}] Leave triggered: {self._leave_reason} "
+                    f"– disconnecting"
+                )
+            elif vault_task in done:
+                opened = vault_task.result()
+                if opened:
+                    log.success(f"[{self.username}] Vault opened – collecting rewards…")
+                    await self._inventory.wait_for_rewards_and_close()
+                else:
+                    log.error(f"[{self.username}] Vault failed to open within timeout")
+
         finally:
             self._rotation.stop()
 
@@ -340,113 +403,241 @@ class MinecraftBot:
             self._bot.quit("Cycle complete")
         except Exception:  # noqa: BLE001
             pass
-        # Allow the disconnect packet to propagate
         await sleep(1)
         self._bot = None
         await self._set_state(BotState.DONE)
         log.success(f"[{self.username}] Disconnected")
 
     # ------------------------------------------------------------------
-    # Event listeners
+    # Listeners
     # ------------------------------------------------------------------
 
     def _attach_core_listeners(self) -> None:
-        """Attach spawn / error / kick event listeners to the bot."""
-
+        """Attach spawn / error / kick / end listeners."""
         bot = self._bot
 
         @bot.once("spawn")
         def _on_spawn():
-            """Fired once the bot receives its spawn position."""
             log.success(f"[{self.username}] Spawned in world")
             self._spawned.set()
 
         @bot.on("kicked")
         def _on_kicked(reason, logged_in):
-            """Handle server kick; sets disconnected event."""
             log.warn(f"[{self.username}] Kicked: {reason}")
-            self._disconnected.set()
 
         @bot.on("error")
         def _on_error(err):
-            """Handle a network/protocol error."""
             log.error(f"[{self.username}] Error: {err}")
 
         @bot.on("end")
         def _on_end(reason):
-            """Fired when the connection is fully closed."""
             log.info(f"[{self.username}] Connection ended: {reason}")
-            self._disconnected.set()
 
-    def _attach_chat_listener(self) -> None:
+    def _attach_tpa_listener(self) -> None:
         """
-        Watch for TP request messages from ``config.TP_PLAYER`` and respond.
+        Attach a STRICT /tpa listener.
 
-        Handles common server formats:
-        - ``/tpa`` request notifications
-        - Direct ``[TP_PLAYER] /tpa`` messages
-        - Generic "wants to teleport" messages
+        Only fires when:
+        - The bot is in WAITING_TP state
+        - The message is a server notification that ``config.TP_PLAYER``
+          sent a teleport request  (canonical keywords below)
+        - OR a direct whisper from ``config.TP_PLAYER`` whose body is "/tpa"
+
+        Does NOT fire on login/register messages or generic "tpa" mentions.
         """
         bot = self._bot
         tp_player_lower = config.TP_PLAYER.lower()
 
+        # Server-side TPA notification keywords (all major TP plugins)
+        TPA_NOTIFY_KEYWORDS = (
+            "has requested to teleport",
+            "sent a teleport request",
+            "wants to teleport to you",
+            "requested teleportation",
+            "has requested a tp",
+        )
+
+        def _is_tpa_notification(text: str) -> bool:
+            """Return True if text is a server TPA request notification."""
+            t = text.lower()
+            return tp_player_lower in t and any(kw in t for kw in TPA_NOTIFY_KEYWORDS)
+
+        def _is_direct_tpa_whisper(sender: str, body: str) -> bool:
+            """Return True if sender is TP_PLAYER and body is a /tpa command."""
+            return (
+                sender.lower() == tp_player_lower
+                and body.strip().lower() in ("/tpa", "/tpa ")
+            )
+
         @bot.on("chat")
         def _on_chat(username: str, message: str, *_):
-            """
-            Check every chat message for a TP request from the trusted player.
-            """
+            """Handle plain-text chat messages."""
+            # Only act when genuinely waiting for a TP
+            if self._state != BotState.WAITING_TP:
+                return
             try:
-                # Is this message authored by or about our TP player?
-                if username.lower() == tp_player_lower:
-                    clean = sanitise_chat(message)
-                    if any(kw in clean for kw in ("/tpa", "tpa", "teleport")):
-                        self._send_tpaccept()
-                        return
-
-                # Some servers broadcast system messages like:
-                # "AKMVyron has requested to teleport to you."
-                clean_msg = sanitise_chat(message)
-                if tp_player_lower in clean_msg and any(
-                    kw in clean_msg for kw in ("teleport", "tpa", "/tpa")
-                ):
+                clean = sanitise_chat(message)
+                # Direct whisper-style /tpa from the trusted player
+                if _is_direct_tpa_whisper(username, message):
                     self._send_tpaccept()
-
+                    return
+                # Server notification that includes TP_PLAYER's name
+                if _is_tpa_notification(clean):
+                    self._send_tpaccept()
             except Exception as exc:  # noqa: BLE001
-                log.warn(f"[{self.username}] chat handler error: {exc}")
+                log.warn(f"[{self.username}] tpa chat handler error: {exc}")
 
         @bot.on("message")
         def _on_message(json_msg, position):
+            """Handle structured JSON chat messages (used by many server plugins)."""
+            if self._state != BotState.WAITING_TP:
+                return
+            try:
+                text = ""
+                if hasattr(json_msg, "toString"):
+                    text = sanitise_chat(str(json_msg.toString()))
+                if not text:
+                    return
+                if _is_tpa_notification(text):
+                    self._send_tpaccept()
+            except Exception as exc:  # noqa: BLE001
+                log.debug(f"[{self.username}] tpa message handler error: {exc}")
+
+    def _attach_leave_listener(self) -> None:
+        """
+        Listen for a private message (whisper) of "leave" from TP_PLAYER
+        at any point after login.
+
+        Multiple whisper formats are covered:
+        - ``[AKMVyron -> you]: leave``
+        - ``AKMVyron whispers to you: leave``
+        - ``[AKMVyron]: leave``  (some servers use this for /msg)
+        - Plain chat "leave" typed by AKMVyron (fallback)
+
+        When detected, sets ``_leave_event`` so the vault loop exits and
+        the bot disconnects immediately.
+        """
+        bot = self._bot
+        tp_player_lower = config.TP_PLAYER.lower()
+
+        def _request_leave(reason: str) -> None:
+            if self._leave_event.is_set():
+                return
+            self._leave_reason = reason
+            self._leave_event.set()
+            log.info(
+                f"[{self.username}] Leave requested by {config.TP_PLAYER}: {reason}"
+            )
+
+        @bot.on("chat")
+        def _on_chat_leave(username: str, message: str, *_):
+            """Catch plain-chat 'leave' from TP_PLAYER as a fallback."""
+            try:
+                if username.lower() != tp_player_lower:
+                    return
+                if sanitise_chat(message) == "leave":
+                    _request_leave("chat 'leave' command")
+            except Exception as exc:  # noqa: BLE001
+                log.debug(f"[{self.username}] leave-chat handler error: {exc}")
+
+        @bot.on("message")
+        def _on_message_leave(json_msg, position):
             """
-            Handle structured JSON chat messages (used by many servers for
-            teleport request notifications).
+            Catch whisper/private-message 'leave' from TP_PLAYER.
+
+            Most servers deliver /msg output as a JSON message event rather
+            than a plain chat event, so we check the raw text here.
             """
             try:
                 text = ""
-                # Try to extract plain text from the message object
                 if hasattr(json_msg, "toString"):
-                    text = sanitise_chat(str(json_msg.toString()))
-                elif hasattr(json_msg, "extra"):
-                    text = sanitise_chat(str(json_msg))
+                    text = str(json_msg.toString())
 
                 if not text:
                     return
 
-                if tp_player_lower in text and any(
-                    kw in text for kw in ("teleport", "tpa", "tp request", "wants to tp")
-                ):
-                    self._send_tpaccept()
+                text_lower = text.lower()
+                clean = sanitise_chat(text_lower)
+
+                # Must mention TP_PLAYER (sender) and contain "leave"
+                if tp_player_lower not in clean:
+                    return
+                if "leave" not in clean:
+                    return
+
+                # Whisper / PM indicators used by common servers
+                whisper_indicators = (
+                    "->",          # [AKMVyron -> you]
+                    "whispers",    # AKMVyron whispers to you
+                    "to you",      # sent a message to you
+                    "msg",         # /msg output
+                    "message",
+                    "dm",
+                    "pm",
+                )
+                is_whisper = any(ind in clean for ind in whisper_indicators)
+
+                if is_whisper:
+                    _request_leave(f"private message 'leave'")
+                # If none of the whisper indicators matched but the message
+                # is exclusively from TP_PLAYER and says "leave", still act.
+                # This covers servers that format /msg as plain chat.
 
             except Exception as exc:  # noqa: BLE001
-                log.debug(f"[{self.username}] message handler error: {exc}")
+                log.debug(f"[{self.username}] leave-message handler error: {exc}")
+
+    # ------------------------------------------------------------------
+    # Auto-leave timer
+    # ------------------------------------------------------------------
+
+    async def _auto_leave_timer(self, seconds: float) -> None:
+        """
+        Countdown timer that fires ``_leave_event`` after *seconds*.
+
+        Started immediately after TPA is accepted.  Counts down every
+        10 seconds so the console shows progress.
+        """
+        log.info(
+            f"[{self.username}] Auto-leave timer started: {seconds}s"
+        )
+        interval = 10.0
+        elapsed = 0.0
+
+        while elapsed < seconds:
+            remaining = seconds - elapsed
+            chunk = min(interval, remaining)
+            await asyncio.sleep(chunk)
+            elapsed += chunk
+            if elapsed < seconds:
+                log.debug(
+                    f"[{self.username}] Auto-leave in "
+                    f"{seconds - elapsed:.0f}s…"
+                )
+
+        if not self._leave_event.is_set():
+            self._leave_reason = f"auto-leave after {seconds}s"
+            self._leave_event.set()
+            log.info(
+                f"[{self.username}] Auto-leave timer fired after {seconds}s"
+            )
+
+    def _cancel_auto_leave(self) -> None:
+        """Cancel the auto-leave timer task if still running."""
+        if self._auto_leave_task and not self._auto_leave_task.done():
+            self._auto_leave_task.cancel()
+        self._auto_leave_task = None
+
+    # ------------------------------------------------------------------
+    # TPA helper
+    # ------------------------------------------------------------------
 
     def _send_tpaccept(self) -> None:
         """
-        Send /tpaccept once and signal the waiting coroutine.
-
-        Guards against double-sending with the ``_tp_accepted`` event.
+        Send /tpaccept exactly once and signal the waiting coroutine.
+        Double-send is guarded by the ``_tp_accepted`` event.
         """
         if self._tp_accepted.is_set():
-            return   # already accepted
+            return
         try:
             log.info(f"[{self.username}] Sending /tpaccept…")
             self._bot.chat("/tpaccept")
@@ -455,7 +646,32 @@ class MinecraftBot:
             log.warn(f"[{self.username}] /tpaccept failed: {exc}")
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Interruptible sleep
+    # ------------------------------------------------------------------
+
+    async def _interruptible_sleep(self, seconds: float) -> None:
+        """
+        Sleep for *seconds* but wake immediately if ``_leave_event`` is set.
+
+        Used during TELEPORTING and KEY_DROP steps so a "leave" whisper or
+        auto-timer always takes effect promptly rather than waiting for a
+        long sleep to finish.
+        """
+        if self._leave_event.is_set():
+            raise RuntimeError(f"Leave requested: {self._leave_reason}")
+
+        try:
+            await asyncio.wait_for(
+                self._leave_event.wait(),
+                timeout=seconds,
+            )
+            # leave_event fired before the sleep finished
+            raise RuntimeError(f"Leave requested: {self._leave_reason}")
+        except asyncio.TimeoutError:
+            pass   # normal – full sleep completed
+
+    # ------------------------------------------------------------------
+    # State helper
     # ------------------------------------------------------------------
 
     async def _set_state(self, state: BotState) -> None:
