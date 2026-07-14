@@ -131,6 +131,7 @@ class MinecraftBot:
             await self._login()
             await self._wait_for_tp()
             await self._accept_tp_delay()
+            await self._wait_for_key_pickup()
             await self._do_vault()
             success = True
 
@@ -261,6 +262,40 @@ class MinecraftBot:
         delay = config.WAIT_AFTER_TP
         log.info(f"[{self.username}] Teleported – waiting {delay}s before interacting…")
         await sleep(delay)
+
+    # ------------------------------------------------------------------
+    # Step: wait for operator to drop the Ominous Vault key
+    # ------------------------------------------------------------------
+
+    async def _wait_for_key_pickup(self) -> None:
+        """
+        Stand still for ``config.WAIT_FOR_KEY_DROP`` seconds so the operator
+        has time to drop the Ominous Vault key on the ground.
+
+        The bot remains stationary — it does not move or look around.
+        The Mineflayer engine picks up dropped items automatically when they
+        land within collection range, so no extra action is needed here.
+
+        After the timer expires, the flow continues directly to vault
+        interaction (rotation + right-click spam).
+        """
+        delay = config.WAIT_FOR_KEY_DROP
+        log.info(
+            f"[{self.username}] Waiting {delay}s for key drop — "
+            f"drop the Ominous Vault key now!"
+        )
+
+        # Count down in 1-second increments so the log stays informative
+        for remaining in range(int(delay), 0, -1):
+            log.debug(f"[{self.username}] Key pickup window: {remaining}s remaining…")
+            await sleep(1)
+
+        # Handle any sub-second remainder
+        leftover = delay - int(delay)
+        if leftover > 0:
+            await sleep(leftover)
+
+        log.success(f"[{self.username}] Key pickup window finished – proceeding to vault")
 
     # ------------------------------------------------------------------
     # Step: vault interaction (rotate + click)

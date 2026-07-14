@@ -69,6 +69,10 @@ TP_PLAYER: str = os.environ.get("TP_PLAYER", "AKMVyron")
 # Bot behaviour
 RIGHT_CLICK_PER_SECOND: float = float(os.environ.get("RIGHT_CLICK_PER_SECOND", "8"))
 WAIT_AFTER_TP: float = float(os.environ.get("WAIT_AFTER_TP", "5"))
+
+# How long to stand still after the initial TP delay so the operator can
+# drop the Ominous Vault key and the bot has time to pick it up.
+WAIT_FOR_KEY_DROP: float = float(os.environ.get("WAIT_FOR_KEY_DROP", "10"))
 ROTATION_SPEED: float = float(os.environ.get("ROTATION_SPEED", "25"))  # degrees/s
 RECONNECT_DELAY: float = float(os.environ.get("RECONNECT_DELAY", "5"))
 
@@ -113,6 +117,8 @@ def validate() -> None:
         raise ConfigError("RIGHT_CLICK_PER_SECOND must be > 0")
     if WAIT_AFTER_TP < 0:
         raise ConfigError("WAIT_AFTER_TP must be >= 0")
+    if WAIT_FOR_KEY_DROP < 0:
+        raise ConfigError("WAIT_FOR_KEY_DROP must be >= 0")
     if ROTATION_SPEED <= 0:
         raise ConfigError("ROTATION_SPEED must be > 0")
     if MAX_BOTS < 1:
