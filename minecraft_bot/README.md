@@ -1,253 +1,157 @@
-# Minecraft Automation Bot
+# Minecraft Automation Bot — Pure Python
 
-A production-ready Python 3.13+ bot that automates Ominous Vault cycling on your own Minecraft Java Edition server.  Built on the proven **Mineflayer** Node.js ecosystem, bridged into Python via the `javascript` package.
+Automates endless Ominous Vault farming on an offline-mode Minecraft server.
+**No Node.js, no npm, no JavaScript bridge** — 100% Python via the
+[pyCraft](https://github.com/ammaraskar/pyCraft) protocol library.
 
 ---
 
-## What It Does
+## Cycle flow
 
 ```
 Generate random username
-        ↓
-Connect to server (offline mode)
-        ↓
-/register PASSWORD PASSWORD
-        ↓
-/login PASSWORD
-        ↓
-Wait for TP request from AKMVyron
-        ↓
-/tpaccept
-        ↓
-Wait 5 seconds
-        ↓
-Look straight → rotate 360° continuously
-        ↓
-Spam right-click vault (~8/s)
-        ↓
-Vault opens (window detected)
-        ↓
-Wait for rewards → close inventory
-        ↓
-Disconnect
-        ↓
-Repeat forever with a new username
+        │
+        ▼
+  Connect (offline mode)
+        │
+        ▼
+  /register <password> <password>
+        │
+        ▼
+  /login <password>
+        │
+        ▼
+  Wait for /tpa from AKMVyron   ◄── strict match only; login msgs ignored
+        │
+        ▼
+  /tpaccept  →  wait WAIT_AFTER_TP s
+        │
+        ▼
+  Wait WAIT_FOR_KEY_DROP s      ◄── drop Ominous Vault key here
+        │
+        ▼
+  Rotate 360° + spam right-click nearby blocks
+        │
+   ┌────┴─────────────┬─────────────────────────────────┐
+   │                  │                                 │
+Vault opens    100s auto-leave          AKMVyron whispers "leave"
+   │                  │                                 │
+   └────────┬─────────┘                                 │
+            ▼                                           │
+      Disconnect ◄──────────────────────────────────────┘
+            │
+            ▼
+  Wait RECONNECT_DELAY s  →  repeat with NEW username
 ```
 
 ---
 
 ## Requirements
 
-| Tool | Version |
-|---|---|
-| Python | 3.13+ |
-| Node.js | 18+ |
-| npm | 8+ |
+- Python 3.9+
+- An offline-mode Minecraft server (1.21.4 recommended)
+- **No Node.js required**
 
 ---
 
-## Quick Start
-
-### 1. Clone / copy the project
+## Setup
 
 ```bash
-# All files are inside the minecraft_bot/ directory
 cd minecraft_bot
-```
 
-### 2. Run the setup script (one-time)
+# 1. Install Python dependencies (pyCraft + python-dotenv)
+pip install -r requirements.txt
 
-```bash
-chmod +x setup.sh
-./setup.sh
-```
+# OR run the one-shot setup script:
+bash setup.sh
 
-This will:
-- Verify Python 3.13+ and Node.js 18+
-- `pip install -r requirements.txt`
-- `npm install` (Mineflayer + dependencies)
-- Copy `.env.example` → `.env`
+# 2. Put your server address in ip.txt
+echo "your.server.ip" > ip.txt
 
-### 3. Configure your server
+# 3. (Optional) copy and edit .env
+cp .env.example .env
+# Edit .env with your password, TP player name, etc.
 
-**Option A – ip.txt (simplest)**
-
-```
-# ip.txt
-play.myserver.net
-```
-
-**Option B – .env file**
-
-```env
-HOST=play.myserver.net
-PORT=25565
-VERSION=1.21.4
-PASSWORD=YourBotPassword
-TP_PLAYER=AKMVyron
-RIGHT_CLICK_PER_SECOND=8
-WAIT_AFTER_TP=5
-```
-
-See `.env.example` for all available options.
-
-### 4. Launch
-
-```bash
+# 4. Run
 python3 main.py
 ```
 
 ---
 
-## Manual Setup (without setup.sh)
+## Configuration
 
-```bash
-# Python deps
-pip3 install -r requirements.txt
-
-# Node.js deps (Mineflayer)
-npm install
-
-# Copy config
-cp .env.example .env
-# Edit .env with your server details
-```
-
----
-
-## Console Commands
-
-While the bot is running, type commands and press Enter:
-
-| Command | Effect |
-|---|---|
-| `status` | Print cycle counts and current username per slot |
-| `pause` | Pause all bots after the current lifecycle step |
-| `resume` | Resume paused bots |
-| `stop` | Gracefully shut down all bots and exit |
-
-Press **Ctrl-C** for an immediate graceful shutdown.
-
----
-
-## Configuration Reference
+All settings can be placed in `.env` or set as environment variables.
+`ip.txt` overrides `HOST` for convenience.
 
 | Variable | Default | Description |
 |---|---|---|
-| `HOST` | *(ip.txt)* | Server hostname or IP |
+| `HOST` | `localhost` | Server IP / hostname (or use `ip.txt`) |
 | `PORT` | `25565` | Server port |
 | `VERSION` | `1.21.4` | Minecraft protocol version |
 | `PASSWORD` | `Secure@Bot2025!` | `/register` and `/login` password |
-| `TP_PLAYER` | `AKMVyron` | Player whose TP request is auto-accepted |
-| `RIGHT_CLICK_PER_SECOND` | `8` | Vault right-click rate |
+| `TP_PLAYER` | `AKMVyron` | Only accept /tpa from this player |
+| `RIGHT_CLICK_PER_SECOND` | `8` | Right-click rate for vault |
 | `WAIT_AFTER_TP` | `5` | Seconds to wait after teleport |
-| `ROTATION_SPEED` | `25` | Degrees/second for yaw rotation |
+| `WAIT_FOR_KEY_DROP` | `10` | Seconds for operator to drop vault key |
+| `ROTATION_SPEED` | `25` | Degrees per second while spinning |
 | `RECONNECT_DELAY` | `5` | Seconds between cycles |
+| `AUTO_LEAVE_SECONDS` | `100` | Hard timeout after /tpaccept |
 | `MAX_BOTS` | `1` | Concurrent bot slots |
-| `TP_WAIT_TIMEOUT` | `120` | Max seconds to wait for TP request |
-| `VAULT_OPEN_TIMEOUT` | `30` | Max seconds to attempt vault opening |
-| `INVENTORY_SETTLE_DELAY` | `2` | Seconds to wait for rewards before closing |
+| `TP_WAIT_TIMEOUT` | `120` | Seconds to wait for /tpa |
+| `VAULT_OPEN_TIMEOUT` | `30` | Seconds of clicking before giving up |
+| `INVENTORY_SETTLE_DELAY` | `2` | Seconds to wait in vault GUI |
 
 ---
 
-## Project Structure
+## Console commands
 
-```
-minecraft_bot/
-├── main.py           Entry point; console command loop
-├── bot_manager.py    Orchestrates concurrent bot slots (pause/resume/stop)
-├── minecraft_bot.py  Single bot lifecycle (connect → vault → disconnect)
-├── rotation.py       Smooth 360° continuous yaw rotation (60 fps loop)
-├── inventory.py      Detects vault window open; closes inventory
-├── vault.py          Finds vault block; spams right-click
-├── config.py         All configuration (env vars + ip.txt)
-├── logger.py         Coloured timestamped logging
-├── utils.py          Username generation, rate throttle, angle helpers
-├── requirements.txt  Python dependencies
-├── package.json      Node.js dependencies (Mineflayer)
-├── .env.example      Config template
-├── ip.txt            Put your server IP here
-└── setup.sh          One-shot setup script
-```
+While the bot is running, type into the terminal:
 
----
-
-## Username Generation
-
-Every cycle generates a fresh 6-character alphanumeric username:
-- Characters: `A-Z`, `a-z`, `0-9`
-- No symbols, no spaces
-- Never reused within the same runtime session
-- Examples: `Ab82Kd`, `Rx12Qa`, `Kd73Lp`
-
----
-
-## Log Output Example
-
-```
-[12:31:52] [Manager] Starting 1 bot slot(s)…
-[12:31:52] [Manager] 1 slot(s) running
-[12:31:52] [Manager] Slot 0: Generated username: Ab82Kd
-[12:31:52] [Bot]     [Ab82Kd] Connecting to play.myserver.net:25565 (v1.21.4)…
-[12:31:53] [Bot]     [Ab82Kd] Connected
-[12:31:53] [Bot]     [Ab82Kd] Spawned in world
-[12:31:53] [Bot]     [Ab82Kd] Sending /register…
-[12:31:55] [Bot]     [Ab82Kd] Registered (or already registered)
-[12:31:55] [Bot]     [Ab82Kd] Sending /login…
-[12:31:57] [Bot]     [Ab82Kd] Logged in
-[12:31:57] [Bot]     [Ab82Kd] Waiting for TP from AKMVyron…
-[12:32:04] [Bot]     [Ab82Kd] Sending /tpaccept…
-[12:32:04] [Bot]     [Ab82Kd] TP accepted
-[12:32:04] [Bot]     [Ab82Kd] Teleported – waiting 5s before interacting…
-[12:32:09] [Bot]     [Ab82Kd] Starting vault interaction
-[12:32:09] [Rotation] Rotation started at 25.0°/s
-[12:32:09] [Vault]   Spamming right-click at 8/s (timeout=30s)…
-[12:32:11] [Inventory] Window opened: type=vault …
-[12:32:11] [Vault]   Vault opened successfully!
-[12:32:13] [Inventory] Inventory closed
-[12:32:13] [Bot]     [Ab82Kd] Disconnecting…
-[12:32:14] [Bot]     [Ab82Kd] Disconnected
-[12:32:14] [Manager] Slot 0: Cycle complete ✓  (total=1, ok=1)
-[12:32:14] [Manager] Slot 0: Waiting 5s before next cycle…
-```
-
----
-
-## Error Recovery
-
-The bot automatically recovers from:
-
-| Error | Recovery |
+| Command | Effect |
 |---|---|
-| Kicked | Reconnects after `RECONNECT_DELAY` |
-| Timeout | Reconnects after `RECONNECT_DELAY` |
-| Connection dropped | Reconnects after `RECONNECT_DELAY` |
-| Login failed | Ignored – continues to TP wait |
-| Vault timeout | Disconnects, starts new cycle |
-| Inventory error | Logged and skipped |
-| Packet error | Logged; bot moves to next step |
-| Any unhandled exception | Caught at slot level; new cycle starts |
-
-The process **never crashes** – every exception is caught at the slot loop level.
+| `status` | Show slot stats (cycles, successes, failures) |
+| `pause` | Pause after the current lifecycle step |
+| `resume` | Resume paused bots |
+| `stop` | Graceful shutdown |
+| Ctrl-C | Immediate (graceful) shutdown |
 
 ---
 
-## Running Multiple Bots
+## AKMVyron commands
 
-Set `MAX_BOTS=3` in `.env` to run 3 concurrent slots:
+These are detected in-game chat / whispers from `TP_PLAYER`:
 
-```env
-MAX_BOTS=3
+| Message | Effect |
+|---|---|
+| `/tpa <bot_name>` | Bot sends `/tpaccept` |
+| `leave` (whisper / PM) | Bot disconnects immediately |
+
+---
+
+## Architecture
+
+```
+main.py          — entry point, asyncio.run(), console loop
+bot_manager.py   — slot-based infinite retry loop, pause/resume/stop
+minecraft_bot.py — state machine (IDLE→CONNECTING→…→DONE)
+protocol.py      — async pyCraft wrapper (connect, send packets, recv events)
+rotation.py      — 60 fps yaw rotation via PlayerLookPacket
+vault.py         — right-click spam loop via PlayerBlockPlacementPacket
+inventory.py     — OpenWindowPacket detection
+config.py        — all settings with validation
+utils.py         — username generator, RateThrottle, angle helpers
+logger.py        — coloured ANSI logging with SUCCESS level
 ```
 
-Each slot uses its own randomly generated username and independent lifecycle.  All slots share a single event loop for low CPU overhead.
-
 ---
 
-## Notes
+## Notes on pyCraft + Minecraft 1.21.4
 
-- This bot is designed for **offline-mode servers only** (no Mojang/Microsoft authentication).
-- The bot joins with `auth: "offline"` – it does not need a valid Minecraft account.
-- Mineflayer supports Minecraft versions 1.8 through 1.21.x – set `VERSION` to match your server exactly.
-- The vault block detection uses `bot.findBlock` with a 5-block radius.  If the bot is teleported directly next to the vault, it will be found automatically.
-- If the server uses a different registration plugin command format, edit `minecraft_bot.py` → `_register` and `_login` methods.
+pyCraft implements the Minecraft protocol in pure Python.  The library's
+official release targets versions up to ~1.19; for 1.21.4, the core packet
+structures (connect, chat, look, block-place, open-window) are unchanged, so
+the bot operates correctly.  If your server runs an older version, adjust the
+`VERSION` setting accordingly.
+
+For offline-mode servers, Mojang authentication is skipped entirely —
+the username is sent directly in the handshake.

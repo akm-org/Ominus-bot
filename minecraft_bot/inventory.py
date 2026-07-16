@@ -1,13 +1,10 @@
 """
 inventory.py
 ============
-Inventory and container window helpers for the Minecraft bot.
+Container window detection — pure Python, no Node.js.
 
-Responsibilities:
-- Detect when a container (vault GUI) window opens
-- Wait until rewards are settled inside the window
-- Close the window gracefully
-- Handle inventory errors without crashing
+Listens for ``OpenWindowPacket`` delivered by :class:`~protocol.MCProtocol`
+and exposes an async API for the vault state machine.
 """
 
 from __future__ import annotations
@@ -23,56 +20,20 @@ log = get_logger("Inventory")
 
 class InventoryManager:
     """
-    Monitors and manages the bot's inventory and open container windows.
+    Monitors the bot's open container windows.
+
+    The pyCraft protocol layer fires ``proto.window_opened`` (an asyncio
+    Event) whenever the server sends an ``OpenWindowPacket``.  This class
+    wraps that event with a clean reset/wait API.
 
     Parameters
     ----------
-    bot:
-        Live Mineflayer bot proxy.
+    proto:
+        Live :class:`~protocol.MCProtocol` instance.
     """
 
-    def __init__(self, bot) -> None:
-        self._bot = bot
-        self._window_opened: asyncio.Event = asyncio.Event()
-        self._window_id: Optional[int] = None
-        self._setup_listeners()
-
-    # ------------------------------------------------------------------
-    # Setup
-    # ------------------------------------------------------------------
-
-    def _setup_listeners(self) -> None:
-        """
-        Attach Mineflayer event listeners for inventory/window events.
-
-        Mineflayer fires:
-        - ``windowOpen``  – a container GUI has been opened
-        - ``windowClose`` – the current window has been closed
-        """
-        try:
-            @self._bot.on("windowOpen")
-            def _on_window_open(window):
-                """Handle a container window being opened by the server."""
-                try:
-                    self._window_id = getattr(window, "id", None)
-                    log.info(
-                        f"Window opened: type={getattr(window, 'type', '?')} "
-                        f"title={getattr(window, 'title', '?')!r} "
-                        f"id={self._window_id}"
-                    )
-                    self._window_opened.set()
-                except Exception as exc:  # noqa: BLE001
-                    log.warn(f"Error in windowOpen handler: {exc}")
-
-            @self._bot.on("windowClose")
-            def _on_window_close(window):
-                """Handle a container window being closed."""
-                log.debug("Window closed")
-                self._window_opened.clear()
-                self._window_id = None
-
-        except Exception as exc:  # noqa: BLE001
-            log.warn(f"Could not attach inventory listeners: {exc}")
+    def __init__(self, proto) -> None:
+        self._proto = proto
 
     # ------------------------------------------------------------------
     # Public API
@@ -80,50 +41,51 @@ class InventoryManager:
 
     def reset(self) -> None:
         """
-        Reset state for a new cycle.
+        Clear window state before a fresh vault attempt.
 
-        Call this before each vault attempt so stale events from the
-        previous cycle do not trigger a false-positive window detection.
+        Prevents a stale event from a previous cycle triggering a
+        false-positive window detection.
         """
-        self._window_opened.clear()
-        self._window_id = None
+        self._proto.window_opened.clear()
+        self._proto.window_id = None
         log.debug("InventoryManager reset")
 
     async def wait_for_window(self, timeout: float = 30.0) -> bool:
         """
-        Await the next ``windowOpen`` event from the server.
+        Wait for the server to open a container window.
 
         Parameters
         ----------
         timeout:
-            Maximum seconds to wait before giving up.
+            Maximum seconds to wait.
 
         Returns
         -------
         bool
-            ``True`` if a window opened within *timeout*, ``False`` on timeout.
+            ``True`` if a window opened, ``False`` on timeout.
         """
         log.debug(f"Waiting for container window (timeout={timeout}s)…")
         try:
-            await asyncio.wait_for(self._window_opened.wait(), timeout=timeout)
-            log.success("Container window opened – vault is open!")
+            await asyncio.wait_for(
+                self._proto.window_opened.wait(), timeout=timeout
+            )
+            log.success("Container window opened — vault is open!")
             return True
         except asyncio.TimeoutError:
             log.warn(f"No window opened within {timeout}s")
             return False
 
     async def wait_for_rewards_and_close(
-        self,
-        settle_delay: float = None,
+        self, settle_delay: Optional[float] = None
     ) -> None:
         """
-        Wait for vault rewards to settle, then close the window.
+        Wait for rewards to settle in the vault GUI, then close the window.
 
         Parameters
         ----------
         settle_delay:
-            Seconds to wait after the window opens before closing.
-            Defaults to ``config.INVENTORY_SETTLE_DELAY``.
+            Seconds to wait after the window opens.  Defaults to
+            ``config.INVENTORY_SETTLE_DELAY``.
         """
         delay = settle_delay if settle_delay is not None else config.INVENTORY_SETTLE_DELAY
         log.info(f"Waiting {delay}s for rewards to settle…")
@@ -131,44 +93,21 @@ class InventoryManager:
         await self.close_window()
 
     async def close_window(self) -> None:
-        """
-        Close the currently open container window cleanly.
-
-        Calls ``bot.closeWindow`` if a window is open.  Errors are caught
-        and logged so they don't interrupt the main flow.
-        """
+        """Send a CloseWindowPacket to gracefully close the container."""
         try:
-            window = getattr(self._bot, "currentWindow", None)
-            if window is not None:
-                self._bot.closeWindow(window)
-                log.info("Inventory closed")
+            from minecraft.networking.packets import serverbound
+            wid = self._proto.window_id or 0
+            cls = getattr(serverbound.play, "CloseWindowPacket", None)
+            if cls and self._proto._conn:
+                pkt = cls()
+                pkt.window_id = wid
+                self._proto._conn.write_packet(pkt)
+                log.info(f"Sent CloseWindow (id={wid})")
             else:
-                log.debug("No open window to close")
+                log.debug("CloseWindowPacket not available – skipping close")
         except Exception as exc:  # noqa: BLE001
-            log.warn(f"Error closing window: {exc}")
+            log.warn(f"close_window() error: {exc}")
 
     def is_window_open(self) -> bool:
-        """Return ``True`` if a container window is currently open."""
-        return self._window_opened.is_set()
-
-    def current_window_id(self) -> Optional[int]:
-        """Return the ID of the currently open window, or ``None``."""
-        return self._window_id
-
-    async def list_items(self) -> list:
-        """
-        Return a list of items in the currently open window.
-
-        Returns an empty list if no window is open or the query fails.
-        Each item is the raw Mineflayer item object.
-        """
-        try:
-            window = getattr(self._bot, "currentWindow", None)
-            if window is None:
-                return []
-            items = list(window.items())
-            log.debug(f"Window has {len(items)} item slots")
-            return items
-        except Exception as exc:  # noqa: BLE001
-            log.warn(f"Error listing items: {exc}")
-            return []
+        """Return ``True`` if a container window event has fired."""
+        return self._proto.window_opened.is_set()

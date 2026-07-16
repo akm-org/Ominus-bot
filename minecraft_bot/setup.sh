@@ -1,90 +1,57 @@
 #!/usr/bin/env bash
-# =============================================================================
-# setup.sh — One-shot setup script for the Minecraft Automation Bot
-# =============================================================================
-# Run once before first launch:
-#   chmod +x setup.sh && ./setup.sh
-# =============================================================================
+# ===========================================================================
+# setup.sh — One-shot setup for the Minecraft Automation Bot (pure Python)
+# ===========================================================================
+# No Node.js / npm required.  Just Python 3.9+ and pip.
+# ===========================================================================
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo ""
 echo "╔══════════════════════════════════════════════════╗"
-echo "║   Minecraft Bot — Setup                          ║"
+echo "║     Minecraft Bot — Pure Python Setup Script     ║"
 echo "╚══════════════════════════════════════════════════╝"
 echo ""
 
-# ---------------------------------------------------------------------------
-# 1. Check Python version
-# ---------------------------------------------------------------------------
-echo "▶ Checking Python 3.13+…"
-if ! python3 --version 2>&1 | grep -qE "3\.(1[3-9]|[2-9][0-9])"; then
-    echo "  ❌  Python 3.13 or newer is required."
-    echo "      Install from https://www.python.org/downloads/"
+# ── Python check ────────────────────────────────────────────────────────────
+if ! command -v python3 &>/dev/null; then
+    echo "ERROR: python3 not found in PATH. Install Python 3.9+ first."
     exit 1
 fi
-python3 --version
-echo "  ✓ Python OK"
 
-# ---------------------------------------------------------------------------
-# 2. Check Node.js
-# ---------------------------------------------------------------------------
-echo ""
-echo "▶ Checking Node.js 18+…"
-if ! command -v node &>/dev/null; then
-    echo "  ❌  Node.js is not installed."
-    echo "      Install from https://nodejs.org/ (LTS recommended)"
-    exit 1
-fi
-NODE_VER=$(node --version | sed 's/v//')
-NODE_MAJOR=$(echo "$NODE_VER" | cut -d. -f1)
-if [ "$NODE_MAJOR" -lt 18 ]; then
-    echo "  ❌  Node.js 18+ required, found v${NODE_VER}"
-    exit 1
-fi
-echo "  node $(node --version)  npm $(npm --version)"
-echo "  ✓ Node.js OK"
+PY_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+echo "Python version: $PY_VERSION"
 
-# ---------------------------------------------------------------------------
-# 3. Install Python dependencies
-# ---------------------------------------------------------------------------
+# ── Install Python dependencies ─────────────────────────────────────────────
 echo ""
-echo "▶ Installing Python dependencies…"
-pip3 install -r requirements.txt --quiet
-echo "  ✓ Python dependencies installed"
+echo "Installing Python dependencies…"
+pip install --upgrade pip --quiet
+pip install -r requirements.txt
 
-# ---------------------------------------------------------------------------
-# 4. Install Node.js (Mineflayer) dependencies
-# ---------------------------------------------------------------------------
 echo ""
-echo "▶ Installing Node.js dependencies (Mineflayer)…"
-npm install --silent
-echo "  ✓ Node.js dependencies installed"
+echo "✓ Python dependencies installed"
 
-# ---------------------------------------------------------------------------
-# 5. Create .env if it doesn't exist
-# ---------------------------------------------------------------------------
-echo ""
-if [ ! -f ".env" ]; then
+# ── Create .env from example if missing ─────────────────────────────────────
+if [[ ! -f .env && -f .env.example ]]; then
     cp .env.example .env
-    echo "▶ Created .env from .env.example"
-    echo "  ⚠  Edit .env (or ip.txt) with your server details before running!"
+    echo "✓ Created .env from .env.example — edit it with your settings"
 else
-    echo "▶ .env already exists – skipping"
+    echo "✓ .env already exists"
 fi
 
-# ---------------------------------------------------------------------------
-# Done
-# ---------------------------------------------------------------------------
+# ── Check ip.txt ─────────────────────────────────────────────────────────────
+if [[ ! -s ip.txt ]]; then
+    echo ""
+    echo "⚠  ip.txt is empty. Add your server IP/hostname before running:"
+    echo "   echo 'your.server.ip' > ip.txt"
+fi
+
 echo ""
 echo "╔══════════════════════════════════════════════════╗"
-echo "║   Setup complete!                                ║"
-echo "║                                                  ║"
-echo "║   1. Put your server IP in ip.txt                ║"
-echo "║   2. Edit .env and set PASSWORD, VERSION, etc.   ║"
-echo "║   3. Run:  python3 main.py                       ║"
+echo "║              Setup complete!                     ║"
+echo "║  Run with:  python3 main.py                      ║"
 echo "╚══════════════════════════════════════════════════╝"
 echo ""
